@@ -1,0 +1,613 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Anim Consolidator — drag/drop + rename/remove + export — three@0.177.0</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <script async src="https://ga.jspm.io/npm:es-module-shims@1.10.0/dist/es-module-shims.js" crossorigin="anonymous"></script>
+
+    <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.177.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/"
+      }
+    }
+    </script>
+
+    <style>
+      :root { color-scheme: dark; }
+      html, body { height: 100%; margin: 0; background:#0b0c10; color:#e6e6e6; font:14px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+      #app { position: fixed; inset: 0; display: grid; grid-template-rows: 1fr auto; }
+      #panel {
+        position:fixed; bottom:0; left:0; right:0; display:flex; flex-wrap:wrap; gap:.5rem; padding:.75rem;
+        background:rgba(0,0,0,.35); backdrop-filter: blur(6px); border-top:1px solid rgba(255,255,255,.08); align-items:center;
+      }
+      button {
+        border:1px solid rgba(255,255,255,.18); background:rgba(255,255,255,.06); color:#fff;
+        padding:.5rem .8rem; border-radius:.6rem; cursor:pointer;
+      }
+      button:hover { background:rgba(255,255,255,.12); }
+      button[disabled] { opacity:.5; cursor:not-allowed; }
+      .badge { font-size:12px; opacity:.75; padding:.2rem .5rem; border:1px solid rgba(255,255,255,.18); border-radius:.5rem; }
+      #log { margin-left:auto; opacity:.8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:40vw; }
+      label { display:inline-flex; align-items:center; gap:.35rem; opacity:.9; }
+      canvas { display:block; }
+
+      /* clips list */
+      #clips { display:flex; gap:.5rem; flex-wrap:wrap; max-width:60vw; overflow:auto; align-items:flex-start; }
+      .clipItem {
+        display:flex; align-items:center; gap:.35rem; padding:.35rem; border:1px solid rgba(255,255,255,.12);
+        border-radius:.6rem; background:rgba(255,255,255,.04);
+      }
+      .clipItem.playing { box-shadow: 0 0 0 2px rgba(255,200,0,.25) inset; }
+      .clipItem .playBtn { font-weight:500; }
+      .clipItem .killBtn { padding:.25rem .45rem; line-height:1; }
+      .clipItem input.rename {
+        width: 10rem; max-width: 40vw; padding:.35rem .5rem; border-radius:.4rem; border:1px solid rgba(255,255,255,.18);
+        background:rgba(0,0,0,.25); color:#fff; outline:none;
+      }
+
+      /* drag & drop overlay */
+      #dropZone {
+        position: fixed; inset: 0; display:none; place-items:center; pointer-events:none;
+        background: rgba(0,0,0,.35);
+        border: 2px dashed rgba(255,255,255,.25);
+      }
+      #dropZone .inner {
+        pointer-events:none;
+        font-size: 18px; opacity:.85; padding:1rem 1.25rem; border-radius:.8rem; border:1px solid rgba(255,255,255,.25);
+        background: rgba(0,0,0,.5);
+      }
+
+      /* single-file role picker */
+      #picker, #multiPicker {
+        position: fixed; inset:0; display:none; place-items:center; background:rgba(0,0,0,.35); backdrop-filter: blur(2px);
+      }
+      .modalCard {
+        min-width: 320px;
+        background: rgba(10,12,16,.95);
+        border:1px solid rgba(255,255,255,.12);
+        border-radius: 12px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,.4);
+      }
+      .modalCard .title { font-weight:600; margin-bottom:.35rem; }
+      .modalCard .name { opacity:.8; margin-bottom:.9rem; word-break: break-all; }
+      .modalCard .row { display:flex; gap:.5rem; justify-content:flex-end; flex-wrap:wrap; }
+      .ghost { opacity:.6; }
+    </style>
+  </head>
+
+  <body>
+    <div id="app">
+      <canvas id="c"></canvas>
+      <div id="panel">
+        <span class="badge">three@0.177.0</span>
+        <button id="openFiles">Import…</button>
+        <label title="toggle bone lines"><input id="skelToggle" type="checkbox" checked /> show skeleton</label>
+        <button id="exportBtn" disabled>Export unified GLB</button>
+        <div id="clips"></div>
+        <span id="log">Drop .glb/.gltf — set Base or Anim — rename/remove — Export.</span>
+      </div>
+
+      <div id="dropZone"><div class="inner">Drop .glb / .gltf files to import</div></div>
+
+      <!-- single-file role picker -->
+      <div id="picker">
+        <div class="modalCard">
+          <div class="title">Import as…</div>
+          <div class="name" id="pickName"></div>
+          <div class="row">
+            <button id="pickAnim">Animation(s)</button>
+            <button id="pickBase">Base Avatar</button>
+            <button id="pickCancel" class="ghost">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- multi-file quick picker -->
+      <div id="multiPicker">
+        <div class="modalCard">
+          <div class="title">Import these files?</div>
+          <div class="name" id="multiPickName"></div>
+          <div class="row">
+            <button id="multiAllAnim">All as Animations</button>
+            <button id="multiPerFile">Choose per file…</button>
+            <button id="multiCancel" class="ghost">Cancel</button>
+          </div>
+        </div>
+      </div>
+
+      <input id="fileInput" type="file" accept=".glb,.gltf,model/gltf-binary,model/gltf+json" multiple hidden />
+    </div>
+
+    <script type="module">
+      import * as THREE from 'three';
+      import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+      import { DRACOLoader } from 'three/addons/loaders/DRACOLoader.js';
+      import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
+      import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+      import * as SkeletonUtils from 'three/addons/utils/SkeletonUtils.js';
+
+      // ---------- UI refs ----------
+      const canvas = document.getElementById('c');
+      const clipsEl = document.getElementById('clips');
+      const skelToggle = document.getElementById('skelToggle');
+      const exportBtn = document.getElementById('exportBtn');
+      const openFilesBtn = document.getElementById('openFiles');
+      const fileInput = document.getElementById('fileInput');
+      const logEl = document.getElementById('log');
+      const dropZone = document.getElementById('dropZone');
+
+      const picker = document.getElementById('picker');
+      const pickName = document.getElementById('pickName');
+      const pickAnim = document.getElementById('pickAnim');
+      const pickBase = document.getElementById('pickBase');
+      const pickCancel = document.getElementById('pickCancel');
+
+      const multiPicker = document.getElementById('multiPicker');
+      const multiPickName = document.getElementById('multiPickName');
+      const multiAllAnim = document.getElementById('multiAllAnim');
+      const multiPerFile = document.getElementById('multiPerFile');
+      const multiCancel = document.getElementById('multiCancel');
+
+      const log = (msg) => (logEl.textContent = msg);
+
+      // ---------- three setup ----------
+      const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      const scene = new THREE.Scene();
+      scene.background = new THREE.Color(0x0f1116);
+
+      const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 100);
+      camera.position.set(2.8, 1.6, 3.6);
+
+      const controls = new OrbitControls(camera, renderer.domElement);
+      controls.target.set(0, 1.2, 0);
+      controls.enableDamping = true;
+
+      scene.add(new THREE.HemisphereLight(0xffffff, 0x222233, 0.85));
+      const key = new THREE.DirectionalLight(0xffffff, 1.15);
+      key.position.set(4, 6, 4);
+      scene.add(key);
+      scene.add(new THREE.GridHelper(20, 20, 0x444444, 0x222222));
+
+      // ---------- loaders/exporter ----------
+      const loader = new GLTFLoader();
+      const draco = new DRACOLoader();
+      draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.177.0/examples/jsm/libs/draco/');
+      loader.setDRACOLoader(draco);
+      const exporter = new GLTFExporter();
+
+      // ---------- state ----------
+      let mixer = null;
+      let currentAction = null;
+      let helper = null;
+
+      let baseGLTF = null;
+      let baseRoot = null;
+      let baseSkinned = null;
+      let baseLabel = 'avatar';
+
+      // keep original animation sources so we can re-retarget if base changes
+      const animSources = []; // each: { id, label, gltf, srcSkinned }
+
+      // the set we actually export/play (retargeted to base)
+      let consolidatedClips = []; // array of THREE.AnimationClip
+      const clipNames = new Set();
+
+      // ---------- helpers ----------
+      const getFirstSkinnedMesh = (root) => {
+        let m = null; root.traverse(o => { if (!m && o.isSkinnedMesh && o.skeleton) m = o; });
+        return m;
+      };
+
+      const ensureUniqueName = (name) => {
+        let base = name || 'Clip', n = base, i = 2;
+        while (clipNames.has(n)) n = `${base} ${i++}`;
+        clipNames.add(n);
+        return n;
+      };
+
+      const renameClip = (clip, newName) => {
+        if (!newName) return;
+        if (clip.name === newName) return;
+        // release old
+        clipNames.delete(clip.name);
+        // ensure uniqueness on new
+        let base = newName.trim();
+        let candidate = base || 'Clip';
+        let i = 2;
+        while (clipNames.has(candidate)) candidate = `${base || 'Clip'} ${i++}`;
+        clip.name = candidate;
+        clipNames.add(candidate);
+      };
+
+      const chooseDefaultClip = (clips) => {
+        if (!clips?.length) return null;
+        const prefer = ['Idle','idle','Breathing','Walk','walk','Run','run'];
+        return clips.find(c => prefer.includes(c.name)) || clips[0];
+      };
+
+      const boneNameFromTrack = (trackName) => {
+        const m = trackName.match(/\.bones\[(.*?)\]/);
+        if (m) return m[1];
+        return trackName.split('.')[0];
+      };
+
+      const clipLooksCompatible = (baseSkinned, clip) => {
+        const baseBones = new Set((baseSkinned?.skeleton?.bones || []).map(b => b.name));
+        let seen = 0, hits = 0;
+        for (const t of clip.tracks) {
+          const bn = boneNameFromTrack(t.name);
+          if (!bn) continue;
+          if (baseBones.has(bn)) hits++;
+          seen++;
+        }
+        return seen > 0 ? (hits / seen) > 0.6 : true;
+      };
+
+      const downloadArrayBuffer = (buffer, filename) => {
+        const blob = new Blob([buffer], { type: 'model/gltf-binary' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(a.href); document.body.removeChild(a); }, 0);
+      };
+
+      function updateExportState() {
+        exportBtn.disabled = !(baseRoot && consolidatedClips.length);
+        exportBtn.textContent = exportBtn.disabled
+          ? 'Export unified GLB'
+          : `Export GLB (${consolidatedClips.length} clip${consolidatedClips.length>1?'s':''})`;
+      }
+
+      function clearBaseInScene() {
+        if (currentAction) { currentAction.stop(); currentAction = null; }
+        if (mixer) { mixer.stopAllAction(); mixer.uncacheRoot(baseRoot); mixer = null; }
+        if (helper) { scene.remove(helper); helper = null; }
+        if (baseRoot) scene.remove(baseRoot);
+      }
+
+      function playClip(clip, fade = 0.2) {
+        if (!mixer || !clip) return;
+        const next = mixer.clipAction(clip);
+        next.reset();
+        next.setLoop(THREE.LoopRepeat, Infinity);
+        next.clampWhenFinished = false;
+        next.enabled = true;
+        next.setEffectiveWeight(1);
+        next.play();
+
+        if (currentAction && currentAction !== next) currentAction.crossFadeTo(next, fade, false);
+        currentAction = next;
+
+        // mark UI
+        [...clipsEl.children].forEach(node => node.classList.remove('playing'));
+        const el = document.querySelector(`.clipItem[data-name="${CSS.escape(clip.name)}"]`);
+        if (el) el.classList.add('playing');
+      }
+
+      async function parseFileToGLTF(file) {
+        const buf = await file.arrayBuffer();
+        return new Promise((resolve, reject) => {
+          loader.parse(buf, '', (gltf) => resolve(gltf), reject);
+        });
+      }
+
+      async function setBaseFromGLTF(gltf, label = 'avatar') {
+        clearBaseInScene();
+
+        baseGLTF = gltf;
+        baseLabel = (label || 'avatar').replace(/\.[^.]+$/, '');
+        baseRoot = gltf.scene;
+        scene.add(baseRoot);
+
+        baseSkinned = getFirstSkinnedMesh(baseRoot);
+        if (!baseSkinned) {
+          log('⚠️ Base model has no SkinnedMesh/skeleton.');
+          return;
+        }
+
+        helper = new THREE.SkeletonHelper(baseSkinned);
+        helper.material.color.set(0xffaa00);
+        helper.visible = skelToggle.checked;
+        scene.add(helper);
+
+        mixer = new THREE.AnimationMixer(baseRoot);
+
+        await rebuildConsolidated();
+
+        const first = chooseDefaultClip(consolidatedClips);
+        if (first) playClip(first);
+
+        log(`Base set: ${baseLabel} — ${consolidatedClips.length} clip(s) ready`);
+      }
+
+      async function addAnimationsFromGLTF(gltf, label = '') {
+        if (!gltf.animations?.length) {
+          log(`No animations found in ${label || 'file'}.`);
+          return;
+        }
+
+        const srcRoot = gltf.scene;
+        const srcSkinned = getFirstSkinnedMesh(srcRoot) || srcRoot;
+        const id = crypto.randomUUID?.() || String(Math.random());
+        animSources.push({ id, label, gltf, srcSkinned });
+
+        if (baseSkinned) {
+          const fileLabel = (label || 'anim').replace(/\.[^.]+$/, '');
+          for (const clip of gltf.animations) {
+            let out = clip;
+            if (!clipLooksCompatible(baseSkinned, clip)) {
+              try {
+                out = SkeletonUtils.retargetClip(baseSkinned, srcSkinned, clip, { useTargetMatrix: true });
+              } catch (e) {
+                console.warn('Retarget failed:', clip.name, 'from', fileLabel, e);
+                continue;
+              }
+            } else {
+              out = clip.clone();
+            }
+            out.name = ensureUniqueName(out.name || `${fileLabel}:${clip.name || 'Clip'}`);
+            consolidatedClips.push(out);
+          }
+          refreshClipsUI();
+          log(`Added ${gltf.animations.length} clip(s) from ${label}. Total: ${consolidatedClips.length}`);
+        } else {
+          log(`Loaded ${gltf.animations.length} clip(s) from ${label}. Set a base avatar to bind them.`);
+        }
+      }
+
+      async function rebuildConsolidated() {
+        const oldSelection = currentAction?.getClip?.().name;
+        consolidatedClips = [];
+        clipNames.clear();
+
+        if (baseGLTF?.animations?.length) {
+          for (const clip of baseGLTF.animations) {
+            const c = clip.clone();
+            c.name = ensureUniqueName(c.name || 'Base Clip');
+            consolidatedClips.push(c);
+          }
+        }
+
+        for (const pack of animSources) {
+          const fileLabel = (pack.label || 'anim').replace(/\.[^.]+$/, '');
+          for (const clip of (pack.gltf.animations || [])) {
+            let out = clip;
+            if (!clipLooksCompatible(baseSkinned, clip)) {
+              try {
+                out = SkeletonUtils.retargetClip(baseSkinned, pack.srcSkinned, clip, { useTargetMatrix: true });
+              } catch (e) {
+                console.warn('Retarget failed:', clip.name, 'from', fileLabel, e);
+                continue;
+              }
+            } else {
+              out = clip.clone();
+            }
+            out.name = ensureUniqueName(out.name || `${fileLabel}:${clip.name || 'Clip'}`);
+            consolidatedClips.push(out);
+          }
+        }
+
+        refreshClipsUI();
+
+        if (oldSelection) {
+          const sel = consolidatedClips.find(c => c.name === oldSelection);
+          if (sel) playClip(sel);
+        }
+      }
+
+      // ---------- CLIP UI ----------
+      function makeClipItem(clip) {
+        const wrap = document.createElement('div');
+        wrap.className = 'clipItem';
+        wrap.dataset.name = clip.name;
+
+        const playBtn = document.createElement('button');
+        playBtn.className = 'playBtn';
+        playBtn.textContent = clip.name;
+
+        const killBtn = document.createElement('button');
+        killBtn.className = 'killBtn';
+        killBtn.title = 'Remove this animation';
+        killBtn.textContent = '✕';
+
+        const rename = document.createElement('input');
+        rename.className = 'rename';
+        rename.type = 'text';
+        rename.value = clip.name;
+        rename.placeholder = 'Rename clip…';
+        rename.style.display = 'none';
+
+        // Play -> also reveal/ focus rename box
+        playBtn.onclick = () => {
+          playClip(clip);
+          // reveal rename input next to it
+          rename.style.display = '';
+          rename.value = clip.name;
+          setTimeout(() => rename.focus(), 0);
+        };
+
+        // Remove clip
+        killBtn.onclick = () => {
+          // stop if currently playing
+          if (currentAction?.getClip?.().name === clip.name) {
+            currentAction.stop();
+            currentAction = null;
+          }
+          // remove from arrays/sets
+          consolidatedClips = consolidatedClips.filter(c => c !== clip);
+          clipNames.delete(clip.name);
+          // update UI
+          wrap.remove();
+          updateExportState();
+        };
+
+        // Rename handlers (Enter/blur)
+        rename.onkeydown = (e) => {
+          if (e.key === 'Enter') rename.blur();
+          if (e.key === 'Escape') { rename.value = clip.name; rename.blur(); }
+        };
+        rename.onblur = () => {
+          const old = clip.name;
+          renameClip(clip, rename.value);
+          playBtn.textContent = clip.name;
+          wrap.dataset.name = clip.name;
+          // Keep input visible after rename so you can tweak again; comment next line to keep:
+          // rename.style.display = 'none';
+          // If we changed uniqueness, ensure button labels remain accurate (handled here)
+          // No need to re-render the whole list.
+        };
+
+        wrap.appendChild(playBtn);
+        wrap.appendChild(killBtn);
+        wrap.appendChild(rename);
+        return wrap;
+      }
+
+      function refreshClipsUI() {
+        clipsEl.innerHTML = '';
+        consolidatedClips.forEach((clip) => {
+          clipsEl.appendChild(makeClipItem(clip));
+        });
+        updateExportState();
+      }
+
+      // ---------- Export ----------
+      function exportUnifiedGLB() {
+        if (!baseRoot || !consolidatedClips.length) return;
+
+        exportBtn.disabled = true;
+        exportBtn.textContent = 'Exporting…';
+        log('Exporting GLB…');
+
+        exporter.parse(
+          baseRoot,
+          (result) => {
+            const filename = `${baseLabel || 'avatar'}_with_${consolidatedClips.length}_anims.glb`;
+            downloadArrayBuffer(result, filename);
+            log(`Exported ${filename}`);
+            updateExportState();
+          },
+          (err) => {
+            console.error(err);
+            log('Export failed: ' + (err?.message || err));
+            updateExportState();
+          },
+          { binary: true, animations: consolidatedClips }
+        );
+      }
+
+      // ---------- drag & drop + pickers ----------
+      function showDropZone(v) { dropZone.style.display = v ? 'grid' : 'none'; }
+      addEventListener('dragenter', (e) => { e.preventDefault(); showDropZone(true); });
+      addEventListener('dragover',  (e) => { e.preventDefault(); showDropZone(true); });
+      addEventListener('dragleave', (e) => { e.preventDefault(); showDropZone(false); });
+      addEventListener('drop', async (e) => {
+        e.preventDefault(); showDropZone(false);
+        const files = [...(e.dataTransfer?.files || [])].filter(f => f && /(\.glb|\.gltf)$/i.test(f.name));
+        if (!files.length) return;
+        await importFilesFlow(files);
+      });
+
+      openFilesBtn.onclick = () => fileInput.click();
+      fileInput.onchange = async (e) => {
+        const files = [...e.target.files].filter(f => /(\.glb|\.gltf)$/i.test(f.name));
+        if (!files.length) return;
+        await importFilesFlow(files);
+        fileInput.value = '';
+      };
+
+      async function importFilesFlow(files) {
+        if (files.length === 1) {
+          // single-file role picker
+          await showSinglePicker(files[0]);
+        } else {
+          // multi-file quick picker: all as animations OR per file
+          await showMultiPicker(files);
+        }
+      }
+
+      // single-file picker (Base vs Anim)
+      function showSinglePicker(file) {
+        pickName.textContent = file.name;
+        picker.style.display = 'grid';
+
+        return new Promise((resolve) => {
+          const done = () => { picker.style.display = 'none'; resolve(); };
+
+          pickAnim.onclick = async () => {
+            const gltf = await parseFileToGLTF(file);
+            await addAnimationsFromGLTF(gltf, file.name);
+            done();
+          };
+          pickBase.onclick = async () => {
+            const gltf = await parseFileToGLTF(file);
+            await setBaseFromGLTF(gltf, file.name);
+            done();
+          };
+          pickCancel.onclick = () => done();
+        });
+      }
+
+      // multi-file picker (all as anims or per-file walk-through)
+      function showMultiPicker(files) {
+        multiPickName.textContent = `${files.length} files`;
+        multiPicker.style.display = 'grid';
+
+        return new Promise((resolve) => {
+          const finish = () => { multiPicker.style.display = 'none'; resolve(); };
+
+          multiAllAnim.onclick = async () => {
+            log(`Importing ${files.length} animation file(s)…`);
+            // parse all concurrently
+            const gltfs = await Promise.all(files.map(parseFileToGLTF));
+            // add all sequentially (retarget per)
+            for (let i=0; i<gltfs.length; i++) {
+              await addAnimationsFromGLTF(gltfs[i], files[i].name);
+            }
+            log(`Imported ${files.length} animation file(s). Total clips: ${consolidatedClips.length}`);
+            finish();
+          };
+
+          multiPerFile.onclick = async () => {
+            finish();
+            for (const f of files) {
+              await showSinglePicker(f); // same flow as single
+            }
+          };
+
+          multiCancel.onclick = () => finish();
+        });
+      }
+
+      exportBtn.onclick = exportUnifiedGLB;
+      skelToggle.addEventListener('change', () => { if (helper) helper.visible = skelToggle.checked; });
+
+      // ---------- render loop ----------
+      const clock = new THREE.Clock();
+      renderer.setAnimationLoop(() => {
+        const dt = clock.getDelta();
+        if (mixer) mixer.update(dt);
+        controls.update();
+        renderer.render(scene, camera);
+      });
+
+      // ---------- resize ----------
+      addEventListener('resize', () => {
+        camera.aspect = innerWidth / innerHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(innerWidth, innerHeight);
+      });
+
+      log('Drop .glb/.gltf — choose role, import many at once as Animations, ✕ to remove, click to rename, then Export.');
+      updateExportState();
+    </script>
+  </body>
+</html>
